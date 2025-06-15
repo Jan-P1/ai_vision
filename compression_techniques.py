@@ -8,6 +8,9 @@ import torch_pruning as tp
 import torch.optim as optim
 from tqdm import tqdm
 
+# After several model changes and updates to main, it is quite possible that some of these functions currently dont work
+# The only currently guaranteed to work is knowledge_distillation
+# global pruning will most likely work as well but needs some updates
 
 def simple_pruning(conv, amount=0.1):
     strategy = tp.strategy.L1Strategy()
@@ -20,7 +23,7 @@ def compute_importance(layer):
         activations = layer.weight * layer.weight.grad
     return torch.mean(torch.abs(activations), dim=(1,2,3))
 
-def global_pruning(model, sensitivity, target_sparsity):
+def global_pruning(model, target_sparsity):
     all_filters = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Conv2d):
