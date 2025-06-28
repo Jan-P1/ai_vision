@@ -29,15 +29,17 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from torchvision import transforms, datasets
-from torchvision.models import VGG19_Weights, VGG11_Weights
+from torchvision.models import VGG19_Weights, MobileNet_V3_Large_Weights
+from torchvision.models.quantization import mobilenet_v3_large
 import torch_pruning as tp
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import pandas as pd
-from compression_techniques import knowledge_distillation, simple_pruning, global_pruning, low_rank_factor, quantize_8bit
+from compression_techniques import knowledge_distillation, global_structured_pruning, low_rank_factor, quantize_8bit
 import io
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+import copy
 
 
 
@@ -130,16 +132,28 @@ if __name__ == "__main__":
     num_classes = df['label'].nunique()
     print(num_classes)
 
+    samples_per_label = 3
+    sampled_df = df.groupby('label', group_keys=False).apply(lambda x: x.sample(n=min(len(x), samples_per_label), random_state=42))
+
     train_dataframe, test_dataframe = train_test_split(
     df, 
     test_size=0.2,
     random_state=42,
     stratify=df['label']
     )
-    vgg19.classifier[6] = nn.Linear(in_features=4096, out_features=num_classes)
+    vgg19.classifier[-1] = nn.Linear(in_features=vgg19.classifier[-1].in_features, out_features=num_classes)
 
+    grad_init_dataset = ParquetImageDataset(sampled_df, transform=transform)
     train_dataset = ParquetImageDataset(train_dataframe, transform=transform)
     test_dataset = ParquetImageDataset(test_dataframe, transform=transform)
+
+    grad_init_loader = DataLoader(
+        grad_init_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -160,7 +174,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
     """
-    This segment was only for retraining our vgg19 model from general purpose to facial recognition
+    This segment was only for retraining our vgg19 model from general object identification to facial recognition
     I am leaving it in if anyone wants to recreate
     My best outcome: Validation loss improved from 0.690 to 0.657, Accuracy: 0.845
     """
@@ -195,12 +209,34 @@ if __name__ == "__main__":
     #             print("Early stopping triggered")
     #             break
 
-    vgg19.load_state_dict(torch.load("./models/vgg19_epoch_6.pth"))
-    teacher_model = vgg19.to(device)
-    student_model = models.vgg11(weights=None)
-    student_model.classifier[6] = nn.Linear(in_features=4096, out_features=num_classes)
-    student_model = student_model.to(device)
-    trained_student = knowledge_distillation(teacher_model, student_model, train_loader, device=device)
+    print("Loading best epoch model weights")
+    vgg19.load_state_dict(torch.load("./vgg19_epoch_5.pth"))
+    print(vgg19)
 
-    model.save('models/student_model.pt')
-    print('Model saved')
+
+    teacher_model = vgg19.to(device)
+    student_model = mobilenet_v3_large(weights="DEFAULT", quantize=False)
+    student_model.classifier[-1] = nn.Linear(in_features=student_model.classifier[-1].in_features, out_features=num_classes)
+    student_model = student_model.to(device)
+    mobilenet_v3_large = knowledge_distillation(teacher_model, student_model, train_loader, test_loader, device=device)
+
+    torch.save(mobilenet_v3_large, 'models/student_model.pt')
+
+
+
+    # mobilenet_v3_large = torch.load("models/student_model.pt", weights_only=False) # uncomment this, comment out the previous 6 lines (starting from teacher_model = vgg19.to(device))
+    # mobilenet_v3_large.to(device)
+    # epoch_loss, epoch_acc = validate(mobilenet_v3_large, test_loader, nn.CrossEntropyLoss(), device)
+    # print(f"Validation loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
+    
+    # mobilenet_v3_large = low_rank_factor(mobilenet_v3_large, rank=0.3, device=device)
+    # torch.save(lrf_mobilenet_v3_large, 'models/lrf_mobilenet_v3_large.pt')
+
+    quantized = mobilenet_v3_large.fuse_model() # quantize_8bit(mobilenet_v3_large, device=device, calibration_loader=grad_init_loader)
+    torch.save(quantized, 'models/quantized_mobilenet_v3_large.pt')
+
+    train(mobilenet_v3_large.to(device), grad_init_loader, nn.CrossEntropyLoss(), optim.Adam(mobilenet_v3_large.parameters(), lr=0.001), device)
+    print("Pruning model")
+    pruned = global_structured_pruning(mobilenet_v3_large, device, 0.5)
+    torch.save(pruned, 'models/mobilenet_v3_large_pruned.pt')
+    print(pruned)
